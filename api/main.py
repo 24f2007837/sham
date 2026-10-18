@@ -1,4 +1,5 @@
 import os, json, re, datetime as dt, urllib.parse
+from collections import Counter
 from decimal import Decimal, ROUND_HALF_UP
 from http.server import BaseHTTPRequestHandler
 from concurrent.futures import ThreadPoolExecutor
@@ -13,6 +14,7 @@ IST = ZoneInfo("Asia/Kolkata")
 _cache = {}
 
 
+# ------------------------------------------------------------ data loading
 def get(path, **params):
     qs = dict(BASE_QS); qs["path"] = path; qs.update(params)
     last = None
@@ -36,7 +38,7 @@ def pdt(s):
 def load():
     if "data" in _cache:
         return _cache["data"]
-    rates = get("/rates")["usd_per_unit"]
+    rates = get("/rates")["usd_per_unit"]          # USD value of one unit -> multiply
     first = get("/orders", page=1)
     pages = int(first.get("pages", 1))
     raw = list(first["orders"])
@@ -44,7 +46,7 @@ def load():
         with ThreadPoolExecutor(12) as ex:
             for rows in ex.map(lambda p: get("/orders", page=p)["orders"], range(2, pages + 1)):
                 raw += rows
-    latest = {}
+    latest = {}                                     # dedupe: latest updated_at wins
     for r in raw:
         u = pdt(r["updated_at"])
         k = r["id"]
@@ -56,7 +58,7 @@ def load():
         data.append({
             "id": r["id"],
             "status": str(r.get("status", "")).strip().lower(),
-            "when": pdt(r["created_at"]).astimezone(IST),
+            "when": pdt(r["created_at"]).astimezone(IST),   # business dates in IST
             "region": str(r.get("region", "")).strip(),
             "product": str(r.get("product", "")).strip(),
             "customer": str(r.get("customer", "")).strip(),
@@ -72,6 +74,7 @@ def money(d):
     return float(Decimal(d).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
 
 
+# ------------------------------------------------------------ date parsing
 MONTHS = ["january", "february", "march", "april", "may", "june", "july",
           "august", "september", "october", "november", "december"]
 MIDX = {m: i + 1 for i, m in enumerate(MONTHS)}
@@ -87,7 +90,6 @@ def month_range(y, m):
 
 
 def parse_period(ql):
-    """returns (start_date, end_date) or ('month', m) or None"""
     iso = re.findall(r"\b(\d{4})-(\d{2})-(\d{2})\b", ql)
     if len(iso) >= 2:
         a = dt.date(*map(int, iso[0])); b = dt.date(*map(int, iso[1]))
@@ -108,7 +110,7 @@ def parse_period(ql):
     m = re.search(rf"\b(\d{{1,2}})(?:st|nd|rd|th)?\s+(?:of\s+)?({MN})\.?,?\s+(\d{{4}})\b", ql)
     if m:
         d = dt.date(int(m[3]), MIDX[m[2]], int(m[1])); return (d, d)
-    m = re.search(rf"\b({MN})\b\.?,?\s*(?:of\s+)?(\d{{4}})\b", ql)
+    m = re.search(rf"\b({MN})\b\.?,?\s*(?:of\s*)?(\d{{4}})\b", ql)
     if m:
         return month_range(int(m[2]), MIDX[m[1]])
     m = re.search(r"\b(20\d{2})\b", ql)
@@ -127,6 +129,11 @@ def find_entity(ql, values):
     return None
 
 
+# ------------------------------------------------------------ answering
+SUP = r"(?:most|highest|top|best|largest|biggest|greatest|leading|lowest|least|fewest|smallest|worst|max(?:imum)?|min(?:imum)?)"
+NOUN = r"(product|item|region|customer|client|buyer)"
+
+
 def answer(question):
     ql = question.lower().strip()
     data = load()
@@ -136,10 +143,10 @@ def answer(question):
     m = re.search(r"\bc\d{3,}\b", ql)
     customer = m[0].upper() if m else None
 
-    refund_q = bool(re.search(r"refund", ql))
+    refund_q = "refund" in ql
     wants_units = bool(re.search(r"\b(units|quantity|quantities|pieces)\b", ql))
     wants_orders = bool(re.search(r"\borders?\b", ql))
-    money_words = bool(re.search(r"dollar|usd|\$|revenue|worth|value|amount|sales|earn|spent|spend|income|total", ql))
+    money_words = bool(re.search(r"dollar|usd|\$|revenue|worth|value|amount|sales|selling|earn|spent|spend|income|total", ql))
 
     status_ok = (lambda d: d["status"] == "refunded") if refund_q else (lambda d: d["status"] == "paid")
 
@@ -157,25 +164,36 @@ def answer(question):
     def val(d):
         return Decimal(d["qty"]) if wants_units else d["usd"]
 
-    # ---- which product/region/customer ... most/least
-    g = re.search(r"\b(?:which|what)\s+(product|item|region|customer)s?\b", ql) or \
-        re.search(r"\btop\s+\d*\s*(product|item|region|customer)s?\b", ql)
+    # ---- ranking: which product / region / customer is top / lowest ...
+    gm = re.search(rf"\b{SUP}\b[\w\s'\-]{{0,40}}?\b{NOUN}s?\b", ql) or \
+         re.search(rf"\b(?:which|what)\s+{NOUN}s?\b", ql)
     group = None
-    if g:
-        group = g[1].replace("item", "product")
+    if gm:
+        group = {"item": "product", "client": "customer", "buyer": "customer"}.get(gm[1], gm[1])
     elif re.search(r"\bwho\b", ql):
         group = "customer"
-    if group and re.search(r"most|highest|top|best|largest|biggest|greatest|lowest|least|fewest|smallest|worst|max|min", ql):
+    has_sup = re.search(rf"\b{SUP}\b|top-selling|best-selling|bestselling", ql)
+    already_filtered = (group == "region" and region) or (group == "product" and product) or \
+                       (group == "customer" and customer)
+    if group and has_sup and not already_filtered and \
+            not re.search(r"how many\s+(?:distinct\s+|unique\s+|different\s+)?(customers|products|regions)", ql):
+        order_mode = bool(re.search(r"(largest|biggest|highest|smallest|lowest)\s+(single\s+)?(order|purchase)", ql))
+        count_mode = bool(re.search(r"most orders|fewest orders|number of orders|order count|most purchases", ql)) \
+            or (wants_orders and not money_words and not wants_units)
         agg = {}
-        count_mode = wants_orders and not money_words or bool(re.search(r"most orders|fewest orders|number of orders|order count", ql))
         for d in rows:
             k = d[group]
-            agg[k] = agg.get(k, Decimal(0)) + (Decimal(1) if count_mode else val(d))
-        if not agg: return None
+            if order_mode:
+                agg[k] = max(agg.get(k, Decimal(0)), d["usd"])
+            else:
+                agg[k] = agg.get(k, Decimal(0)) + (Decimal(1) if count_mode else val(d))
+        if not agg:
+            return None
         low = bool(re.search(r"lowest|least|fewest|smallest|worst|\bmin", ql))
         ordered = sorted(agg.items(), key=lambda kv: (kv[1] if low else -kv[1], kv[0]))
         t = re.search(r"\btop\s+(\d+)", ql)
-        if t: return [k for k, _ in ordered[:int(t[1])]]
+        if t:
+            return [k for k, _ in ordered[:int(t[1])]]
         return ordered[0][0]
 
     # ---- distinct counts
@@ -184,8 +202,8 @@ def answer(question):
         col = m[1][:-1]
         return len({d[col] for d in rows})
 
-    # ---- average / median / max / min
-    if re.search(r"average|\bavg\b|\bmean\b|on average", ql):
+    # ---- average / median / max / min order
+    if re.search(r"average|\bavg\b|\bmean\b", ql):
         if not rows: return 0
         return money(sum((val(d) for d in rows), Decimal(0)) / len(rows))
     if "median" in ql:
@@ -209,15 +227,16 @@ def answer(question):
     return money(total)
 
 
+# ------------------------------------------------------------ HTTP
 def debug_info():
     data = load()
-    from collections import Counter
     return {
         "raw_rows": _cache.get("raw_rows"), "unique_orders": len(data),
         "statuses": Counter(d["status"] for d in data),
         "regions": sorted({d["region"] for d in data}),
         "products": sorted({d["product"] for d in data}),
-        "first_date": str(min(d["when"] for d in data)), "last_date": str(max(d["when"] for d in data)),
+        "first_date": str(min(d["when"] for d in data)),
+        "last_date": str(max(d["when"] for d in data)),
     }
 
 
