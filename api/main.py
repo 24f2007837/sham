@@ -1,36 +1,32 @@
-import os, json, time, io, contextlib, traceback, urllib.parse, collections
-import datetime, decimal, statistics, re, threading
-import requests
+import os, json, re, math, datetime as dt, urllib.parse
+from decimal import Decimal, ROUND_HALF_UP
 from http.server import BaseHTTPRequestHandler
+from concurrent.futures import ThreadPoolExecutor
+from zoneinfo import ZoneInfo
+import requests
 
-LEDGER_URL = os.environ["LEDGER_URL"]
-ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
-MODEL = os.environ.get("MODEL", "claude-sonnet-4-6")
-DEADLINE = 13.0
-
+LEDGER_URL = os.environ.get("LEDGER_URL", "")
 _p = urllib.parse.urlparse(LEDGER_URL)
 BASE = f"{_p.scheme}://{_p.netloc}{_p.path}"
 BASE_QS = dict(urllib.parse.parse_qsl(_p.query))
-HOST = _p.netloc
-
+IST = ZoneInfo("Asia/Kolkata")
+UTC = dt.timezone.utc
 _cache = {}
-_lock = threading.Lock()
 
 
-def _fetch(url, params=None):
-    key = (url, tuple(sorted((params or {}).items())))
+# ---------------------------------------------------------------- fetching
+def get(path="/", **params):
+    key = (path, tuple(sorted(params.items())))
     if key in _cache:
         return _cache[key]
+    qs = dict(BASE_QS); qs["path"] = path; qs.update(params)
     last = None
     for _ in range(3):
         try:
-            r = requests.get(url, params=params, timeout=8)
-            if r.status_code >= 400:
-                raise RuntimeError(f"HTTP {r.status_code}: {r.text[:200]}")
-            try:
-                val = r.json()
-            except Exception:
-                val = r.text
+            r = requests.get(BASE, params=qs, timeout=8)
+            r.raise_for_status()
+            try: val = r.json()
+            except Exception: val = r.text
             _cache[key] = val
             return val
         except Exception as e:
@@ -38,21 +34,7 @@ def _fetch(url, params=None):
     raise last
 
 
-def get(path="/", **params):
-    qs = dict(BASE_QS)
-    qs["path"] = path
-    qs.update(params)
-    return _fetch(BASE, qs)
-
-
-def raw_get(url):
-    if urllib.parse.urlparse(url).netloc != HOST:
-        raise ValueError("Only the ledger host is allowed")
-    return _fetch(url)
-
-
-def _rows(resp):
-    """Find the list of records inside a response."""
+def rows_of(resp):
     if isinstance(resp, list):
         return resp
     if isinstance(resp, dict):
@@ -66,180 +48,353 @@ def _rows(resp):
 
 
 def all_orders():
-    """Every raw order row from every page (not deduplicated)."""
-    if "ALL_ORDERS" in _cache:
-        return _cache["ALL_ORDERS"]
-    out, seen_first = [], set()
-    for page in range(1, 400):
-        resp = get("/orders", page=page)
-        rows = _rows(resp)
-        if not rows:
-            break
-        sig = json.dumps(rows[0], sort_keys=True, default=str)
-        if sig in seen_first:
-            break
-        seen_first.add(sig)
-        out.extend(rows)
-        if isinstance(resp, dict):
-            more = resp.get("has_more", resp.get("hasMore"))
-            nxt = resp.get("next") or resp.get("next_page") or resp.get("nextPage")
-            tp = resp.get("total_pages") or resp.get("totalPages") or resp.get("pages")
-            if more is False or (more is None and nxt in (None, "", False) and
-                                 ("next" in resp or "next_page" in resp or "nextPage" in resp)):
-                break
-            if tp and page >= int(tp):
-                break
-    _cache["ALL_ORDERS"] = out
+    if "ALL" in _cache:
+        return _cache["ALL"]
+    out, seen, page = [], set(), 1
+    done = False
+    while not done and page < 500:
+        pages = list(range(page, page + 8))
+        with ThreadPoolExecutor(8) as ex:
+            results = list(ex.map(lambda p: rows_of(get("/orders", page=p)), pages))
+        for rows in results:
+            if not rows:
+                done = True; break
+            sig = json.dumps(rows[0], sort_keys=True, default=str)
+            if sig in seen:
+                done = True; break
+            seen.add(sig)
+            out.extend(rows)
+        page += 8
+    _cache["ALL"] = out
     return out
 
 
-def _warm():
-    try:
-        get("/")
-        get("/rates")
-        all_orders()
-    except Exception:
-        pass
+# ---------------------------------------------------------------- helpers
+def norm(k): return re.sub(r"[^a-z0-9]", "", str(k).lower())
 
 
-threading.Thread(target=_warm, daemon=True).start()
-
-
-def _short(x, n):
-    s = x if isinstance(x, str) else json.dumps(x, default=str)
-    return s[:n]
-
-
-def context_text():
-    parts = []
-    try:
-        parts.append("ROOT (get('/')):\n" + _short(get("/"), 1500).replace(LEDGER_URL.split("&path")[0], "<URL>"))
-    except Exception as e:
-        parts.append(f"root error {e}")
-    try:
-        parts.append("RATES (get('/rates')):\n" + _short(get("/rates"), 2500))
-    except Exception as e:
-        parts.append(f"rates error {e}")
-    try:
-        p1 = get("/orders", page=1)
-        if isinstance(p1, dict):
-            meta = {k: v for k, v in p1.items() if not isinstance(v, list)}
-            parts.append("ORDERS page-1 envelope: " + _short(meta, 600))
-        rows = _rows(p1)
-        parts.append(f"ORDERS page-1 has {len(rows)} rows; first 3:\n" + _short(rows[:3], 1800))
-    except Exception as e:
-        parts.append(f"orders error {e}")
-    try:
-        parts.append("EXPORT (get('/export')) sample:\n" + _short(get("/export"), 1200))
-    except Exception as e:
-        parts.append(f"export error {e}")
-    return "\n\n".join(parts)
-
-
-SYSTEM = """You answer questions about Acme Appliances' order ledger (revenue, refunds, products, customers).
-You have a Python tool `run_python`. Helpers available in it:
-  all_orders() -> list of ALL raw order rows from all pages (cached, instant, NOT deduplicated)
-  get(path, **params) -> parsed JSON/text from a ledger path e.g. get('/rates'), get('/export'), get('/orders', page=2)
-  raw_get(url) -> same for a full URL
-Pre-imported: json, re, collections, datetime, decimal (Decimal), statistics, zoneinfo via datetime.
-Variables persist between calls. print() results; output is truncated.
-
-MANDATORY RULES from the ledger docs:
-- Business dates use Asia/Kolkata. Convert every timestamp to that timezone (zoneinfo.ZoneInfo('Asia/Kolkata')) BEFORE deciding day/month/year. Parse ISO strings with a trailing Z correctly.
-- An order id can appear multiple times; the row with the LATEST updated_at is the current one. Deduplicate by id FIRST (compare parsed datetimes), then filter.
-- Only orders with status 'paid' (after dedupe) count as revenue.
-- Money is USD to the cent. If rows are in other currencies, convert with /rates exactly as that endpoint describes (check its direction: units per USD vs USD per unit). Use Decimal and round half up to 2 dp at the end (or per the data's own rounding if rates docs say so).
-- Match region/product/customer text case-insensitively and whitespace-trimmed, but return product names exactly as the API spells them.
-- Refund questions: inspect the fields/statuses for refunds (e.g. status values like 'refunded', refund amount fields) and any /export differences; decide by the data.
-
-Workflow: first call run_python ONCE to inspect (print distinct values of status/currency/region fields, key names, counts, sample of duplicates, date formats). Then compute and call submit_answer. If the question is simple and field names are clear from the samples, compute directly in the first call and print the result, then submit. You have about 10 seconds total, so be quick, with at most 3 tool calls.
-
-submit_answer(answer_json): JSON value. Number for numeric answers (money with 2 decimals), string for names, list for lists, boolean for yes/no. No units or extra text.
-
-=== LEDGER CONTEXT ===
-{ctx}
-"""
-
-TOOLS = [
-    {"name": "run_python", "description": "Run Python; returns stdout.",
-     "input_schema": {"type": "object", "properties": {"code": {"type": "string"}}, "required": ["code"]}},
-    {"name": "submit_answer", "description": "Submit final answer as JSON-encoded value.",
-     "input_schema": {"type": "object", "properties": {"answer_json": {"type": "string"}}, "required": ["answer_json"]}},
-]
-
-
-def run_code(code, ns):
-    buf = io.StringIO()
-    try:
-        with contextlib.redirect_stdout(buf):
-            exec(code, ns)
-    except Exception:
-        buf.write("\nERROR:\n" + traceback.format_exc()[-1500:])
-    out = buf.getvalue()
-    return out[:5000] + ("\n...[truncated]" if len(out) > 5000 else "")
-
-
-def parse_answer(s):
-    try:
-        v = json.loads(s)
-    except Exception:
-        return s
-    if isinstance(v, float):
-        v = round(v, 2)
-    return v
-
-
-def llm(messages, system, remaining):
-    r = requests.post(
-        "https://api.anthropic.com/v1/messages",
-        headers={"x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01",
-                 "content-type": "application/json"},
-        json={"model": MODEL, "max_tokens": 3000, "system": system,
-              "tools": TOOLS, "messages": messages},
-        timeout=max(3, remaining))
-    r.raise_for_status()
-    return r.json()
-
-
-_ctx = {}
-
-
-def answer_question(question):
-    t0 = time.time()
-    if "t" not in _ctx or time.time() - _ctx["t"] > 600:
-        _ctx["v"] = context_text()
-        _ctx["t"] = time.time()
-    system = SYSTEM.format(ctx=_ctx["v"])
-    ns = {"get": get, "raw_get": raw_get, "all_orders": all_orders, "json": json, "re": re,
-          "collections": collections, "datetime": datetime, "decimal": decimal,
-          "Decimal": decimal.Decimal, "statistics": statistics}
-    import zoneinfo
-    ns["zoneinfo"] = zoneinfo
-    messages = [{"role": "user", "content": f"Question: {question}"}]
-    for step in range(5):
-        remaining = DEADLINE - (time.time() - t0)
-        if remaining < 2:
-            break
-        resp = llm(messages, system, remaining)
-        messages.append({"role": "assistant", "content": resp["content"]})
-        results = []
-        for block in resp["content"]:
-            if block["type"] != "tool_use":
-                continue
-            if block["name"] == "submit_answer":
-                return parse_answer(block["input"].get("answer_json", "null"))
-            out = run_code(block["input"].get("code", ""), ns)
-            results.append({"type": "tool_result", "tool_use_id": block["id"], "content": out or "(no output)"})
-        if not results:
-            messages.append({"role": "user", "content": "Call submit_answer now."})
-        else:
-            messages.append({"role": "user", "content": results})
+def pick(row, cands):
+    m = {norm(k): k for k in row}
+    for c in cands:
+        if c in m and row[m[c]] not in (None, ""):
+            return row[m[c]]
     return None
+
+
+def D(x):
+    try:
+        if isinstance(x, str):
+            x = re.sub(r"[,$\s]", "", x)
+        return Decimal(str(x))
+    except Exception:
+        return None
+
+
+def money(d):
+    return float(d.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+
+
+def parse_dt(v):
+    if v is None: return None
+    try:
+        if isinstance(v, (int, float)) or (isinstance(v, str) and re.fullmatch(r"\d{10,13}(\.\d+)?", v)):
+            x = float(v)
+            if x > 1e11: x /= 1000
+            return dt.datetime.fromtimestamp(x, UTC)
+        s = str(v).strip().replace("Z", "+00:00")
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", s): s += "T00:00:00"
+        d = dt.datetime.fromisoformat(s.replace(" ", "T", 1) if " " in s and "T" not in s else s)
+        if d.tzinfo is None:
+            d = d.replace(tzinfo=UTC)
+        return d
+    except Exception:
+        for f in ("%d/%m/%Y", "%m/%d/%Y", "%d-%m-%Y", "%b %d, %Y", "%B %d, %Y"):
+            try: return dt.datetime.strptime(str(v), f).replace(tzinfo=UTC)
+            except Exception: pass
+    return None
+
+
+# ---------------------------------------------------------------- rates
+def build_rates():
+    if "RATES" in _cache:
+        return _cache["RATES"]
+    raw = get("/rates")
+    text = json.dumps(raw).lower()
+    table = {}   # cur -> list of (date or None, Decimal)
+
+    def add(cur, rate, date=None):
+        r = D(rate)
+        if cur and r and r > 0:
+            table.setdefault(str(cur).upper(), []).append((parse_dt(date) if date else None, r))
+
+    def walk(o, date=None):
+        if isinstance(o, dict):
+            if all(isinstance(v, (int, float, str)) and D(v) is not None for v in o.values()) and \
+               all(re.fullmatch(r"[A-Za-z]{3}", str(k)) for k in o):
+                for k, v in o.items(): add(k, v, date)
+                return
+            for k, v in o.items():
+                if re.fullmatch(r"\d{4}-\d{2}(-\d{2})?", str(k)) and isinstance(v, dict):
+                    walk(v, k)
+                else:
+                    walk(v, date)
+        elif isinstance(o, list):
+            for e in o:
+                if isinstance(e, dict):
+                    cur = pick(e, ["currency", "code", "ccy", "from", "symbol"])
+                    rate = pick(e, ["rate", "value", "usdrate", "rateusd", "perusd", "tousd", "usdper"])
+                    d = pick(e, ["date", "effectivedate", "asof", "month", "validfrom", "from_date"])
+                    if cur and rate is not None:
+                        add(cur, rate, d)
+                    else:
+                        walk(e, date)
+    walk(raw)
+
+    # direction: True => value is "units of currency per 1 USD" (divide)
+    per_usd = True
+    if any(h in text for h in ("to_usd", "tousd", "usd_per", "usdper", "usd_value")):
+        per_usd = False
+    elif any(h in text for h in ("per_usd", "perusd", "from_usd", "fromusd")):
+        per_usd = True
+    else:
+        probe = {c: v[-1][1] for c, v in table.items()}
+        if "INR" in probe: per_usd = probe["INR"] > 5
+        elif "JPY" in probe: per_usd = probe["JPY"] > 5
+        elif "EUR" in probe: per_usd = probe["EUR"] < 1.0
+    for c in table: table[c].sort(key=lambda t: (t[0] is not None, t[0] or dt.datetime.min.replace(tzinfo=UTC)))
+    res = (table, per_usd)
+    _cache["RATES"] = res
+    return res
+
+
+def to_usd(amount, cur, when):
+    if amount is None: return None
+    if not cur or str(cur).upper() == "USD": return amount
+    table, per_usd = build_rates()
+    lst = table.get(str(cur).upper())
+    if not lst: return amount
+    rate = lst[-1][1]
+    dated = [t for t in lst if t[0] is not None]
+    if dated and when is not None:
+        ok = [t for t in dated if t[0] <= when]
+        rate = (ok[-1] if ok else dated[0])[1]
+    return amount / rate if per_usd else amount * rate
+
+
+# ---------------------------------------------------------------- normalize
+ID = ["orderid", "id", "order", "ordernumber", "orderno"]
+UPD = ["updatedat", "modifiedat", "lastupdated", "updated", "updatedon"]
+DATE = ["orderdate", "createdat", "orderedat", "placedat", "date", "timestamp", "paidat", "created", "createdon", "ordertime"]
+STATUS = ["status", "orderstatus", "state"]
+REGION = ["region", "salesregion", "territory", "area"]
+PRODUCT = ["product", "productname", "item", "itemname", "sku", "productid"]
+CUST = ["customername", "customer", "customerid", "customeremail", "client", "buyer"]
+CUR = ["currency", "currencycode", "ccy"]
+AMT_USD = ["amountusd", "usdamount", "totalusd", "priceusd", "revenueusd"]
+AMT = ["amount", "total", "totalamount", "grandtotal", "netamount", "revenue", "value", "price", "subtotal", "ordertotal"]
+AMT_C = ["amountcents", "totalcents", "pricecents"]
+QTY = ["quantity", "qty", "units", "count"]
+UNIT = ["unitprice", "priceperunit", "unitcost"]
+REF = ["refundamount", "refundedamount", "refund", "refundtotal", "amountrefunded", "refundusd"]
+
+
+def normalize():
+    if "NORM" in _cache:
+        return _cache["NORM"]
+    latest = {}
+    for i, r in enumerate(all_orders()):
+        if not isinstance(r, dict): continue
+        oid = pick(r, ID)
+        key = oid if oid is not None else ("row", i)
+        u = parse_dt(pick(r, UPD)) or dt.datetime.min.replace(tzinfo=UTC)
+        if key not in latest or u >= latest[key][0]:
+            latest[key] = (u, r)
+    out = []
+    for u, r in latest.values():
+        when = parse_dt(pick(r, DATE))
+        cur = pick(r, CUR)
+        qty = D(pick(r, QTY)) if pick(r, QTY) is not None else None
+        a = pick(r, AMT_USD)
+        if a is not None:
+            usd = D(a)
+        else:
+            a = pick(r, AMT); amt = D(a) if a is not None else None
+            if amt is None and pick(r, AMT_C) is not None:
+                amt = D(pick(r, AMT_C)) / 100
+            if amt is None and pick(r, UNIT) is not None and qty is not None:
+                amt = D(pick(r, UNIT)) * qty
+            usd = to_usd(amt, cur, when)
+        rf = pick(r, REF)
+        status = str(pick(r, STATUS) or "").strip().lower()
+        refund = None
+        if rf is not None and D(rf) is not None:
+            refund = to_usd(D(rf), cur, when)
+        elif "refund" in status:
+            refund = usd
+        out.append({
+            "status": status,
+            "when": when.astimezone(IST) if when else None,
+            "region": pick(r, REGION), "product": pick(r, PRODUCT), "customer": pick(r, CUST),
+            "usd": usd, "refund": refund, "qty": qty,
+            "refunded_flag": ("refund" in status) or (refund is not None and refund > 0),
+        })
+    _cache["NORM"] = out
+    return out
+
+
+# ---------------------------------------------------------------- question parsing
+MONTHS = {m: i + 1 for i, m in enumerate(
+    ["january", "february", "march", "april", "may", "june", "july", "august",
+     "september", "october", "november", "december"])}
+MABBR = {k[:3]: v for k, v in MONTHS.items()}
+
+
+def parse_period(q):
+    ql = q.lower()
+    m = re.search(r"\b(\d{4})-(\d{2})-(\d{2})\b", ql)
+    if m:
+        d = dt.date(int(m[1]), int(m[2]), int(m[3])); return (d, d)
+    m = re.search(r"\b(\d{4})-(\d{2})\b", ql)
+    if m: return month_range(int(m[1]), int(m[2]))
+    m = re.search(r"\bq([1-4])\s*(?:of\s*)?(\d{4})\b", ql)
+    if m:
+        s = (int(m[1]) - 1) * 3 + 1
+        return (dt.date(int(m[2]), s, 1), month_range(int(m[2]), s + 2)[1])
+    names = "|".join(list(MONTHS) + list(MABBR))
+    m = re.search(rf"\b({names})\.?\s+(\d{{1,2}})(?:st|nd|rd|th)?,?\s+(\d{{4}})\b", ql)
+    if m:
+        mo = MONTHS.get(m[1]) or MABBR[m[1][:3]]; d = dt.date(int(m[3]), mo, int(m[2])); return (d, d)
+    m = re.search(rf"\b({names})\.?,?\s+(\d{{4}})\b", ql)
+    if m:
+        mo = MONTHS.get(m[1]) or MABBR[m[1][:3]]; return month_range(int(m[2]), mo)
+    m = re.search(r"\b(20\d{2})\b", ql)
+    if m: return (dt.date(int(m[1]), 1, 1), dt.date(int(m[1]), 12, 31))
+    return None
+
+
+def month_range(y, mo):
+    first = dt.date(y, mo, 1)
+    nxt = dt.date(y + (mo == 12), (mo % 12) + 1, 1)
+    return (first, nxt - dt.timedelta(days=1))
+
+
+def match_entity(q, values):
+    ql = " " + re.sub(r"[^a-z0-9 ]", " ", q.lower()) + " "
+    best = None
+    for v in {x for x in values if x}:
+        vv = " " + re.sub(r"[^a-z0-9 ]", " ", str(v).lower()).strip() + " "
+        if vv.strip() and vv in ql and (best is None or len(str(v)) > len(str(best))):
+            best = v
+    return best
+
+
+def answer(question):
+    q = question.strip()
+    ql = q.lower()
+    data = normalize()
+    period = parse_period(q)
+    region = match_entity(q, [d["region"] for d in data])
+    product = match_entity(q, [d["product"] for d in data])
+    customer = match_entity(q, [d["customer"] for d in data])
+
+    refund_q = "refund" in ql
+    metric = "refund" if refund_q else "revenue"
+    if re.search(r"\b(units|quantity|pieces|sold)\b", ql) and not re.search(r"revenue|earn|sales", ql):
+        metric = "qty"
+    count_q = bool(re.search(r"how many|number of|count of|\bcount\b", ql))
+    avg_q = bool(re.search(r"average|avg|mean", ql))
+
+    def keep(d, need_paid):
+        if need_paid and d["status"] != "paid": return False
+        if period:
+            if not d["when"]: return False
+            day = d["when"].date()
+            if not (period[0] <= day <= period[1]): return False
+        if region and str(d["region"]).lower() != str(region).lower(): return False
+        if product and str(d["product"]).lower() != str(product).lower(): return False
+        if customer and str(d["customer"]).lower() != str(customer).lower(): return False
+        return True
+
+    need_paid = not refund_q
+    rows = [d for d in data if keep(d, need_paid)]
+    if refund_q:
+        rows = [d for d in rows if d["refunded_flag"]]
+
+    def val(d):
+        if metric == "refund": return d["refund"] or Decimal(0)
+        if metric == "qty": return d["qty"] or Decimal(0)
+        return d["usd"] or Decimal(0)
+
+    # which / top / list intent
+    group = None
+    if re.search(r"\b(which|what|top|best|highest|lowest|most|least|who)\b.*\b(product|item)s?\b", ql) or "best-selling" in ql or "best selling" in ql:
+        group = "product"
+    elif re.search(r"\b(which|what|top|best|highest|lowest|most|least)\b.*\bregion", ql):
+        group = "region"
+    elif re.search(r"\b(who|which|top|best)\b.*\b(customer|client|buyer)s?\b", ql) or ql.startswith("who"):
+        group = "customer"
+    if group and not re.search(r"how many|number of", ql):
+        agg = {}
+        for d in rows:
+            k = d[group]
+            if k is None: continue
+            if re.search(r"most orders|number of orders|order count|most frequent", ql):
+                agg[k] = agg.get(k, 0) + 1
+            else:
+                agg[k] = agg.get(k, Decimal(0)) + val(d)
+        if not agg: return None
+        low = bool(re.search(r"lowest|least|fewest|smallest|worst|minimum|min\b", ql))
+        ordered = sorted(agg.items(), key=lambda kv: (kv[1], str(kv[0])) if low else (-kv[1], str(kv[0])))
+        m = re.search(r"\btop\s+(\d+)|\b(\d+)\s+(?:best|highest|top)", ql)
+        if m:
+            n = int(m[1] or m[2]); return [k for k, _ in ordered[:n]]
+        if re.search(r"\blist\b|\ball\b", ql): return [k for k, _ in ordered]
+        return ordered[0][0]
+
+    # distinct counts
+    if count_q:
+        for col, pat in (("customer", r"customers?|clients?|buyers?"), ("product", r"products?|items?"), ("region", r"regions?")):
+            if re.search(rf"how many (?:distinct |unique |different )?(?:{pat})", ql):
+                return len({d[col] for d in rows if d[col] is not None})
+        return len(rows)
+
+    total = sum((val(d) for d in rows), Decimal(0))
+    if avg_q:
+        return money(total / len(rows)) if rows else 0
+    if metric == "qty":
+        return int(total) if total == total.to_integral() else float(total)
+    return money(total)
+
+
+# ---------------------------------------------------------------- HTTP
+def debug_info():
+    info = {}
+    for name, fn in (("root", lambda: get("/")), ("rates", lambda: get("/rates")),
+                     ("export", lambda: get("/export")),
+                     ("orders_page1", lambda: get("/orders", page=1))):
+        try:
+            v = fn(); s = json.dumps(v, default=str)
+            info[name] = s[:1500]
+        except Exception as e:
+            info[name] = f"ERROR {e}"
+    try:
+        o = all_orders()
+        info["total_raw_rows"] = len(o)
+        n = normalize()
+        info["unique_orders"] = len(n)
+        info["statuses"] = sorted({d["status"] for d in n})
+        info["regions"] = sorted({str(d["region"]) for d in n})[:30]
+        info["products"] = sorted({str(d["product"]) for d in n})[:50]
+        info["sample_normalized"] = [{k: str(v) for k, v in d.items()} for d in n[:3]]
+        info["rates_direction_per_usd"] = build_rates()[1]
+    except Exception as e:
+        info["normalize_error"] = f"{type(e).__name__}: {e}"
+    return info
 
 
 class handler(BaseHTTPRequestHandler):
     def _send(self, code, obj):
-        body = json.dumps(obj).encode()
+        body = json.dumps(obj, default=str).encode()
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
         self.send_header("Access-Control-Allow-Origin", "*")
@@ -252,12 +407,22 @@ class handler(BaseHTTPRequestHandler):
         self._send(204, {})
 
     def do_GET(self):
-        self._send(200, {"status": "ok", "usage": 'POST {"question": "..."}'})
+        qs = dict(urllib.parse.parse_qsl(urllib.parse.urlparse(self.path).query))
+        try:
+            if not LEDGER_URL:
+                return self._send(200, {"error": "LEDGER_URL env var missing"})
+            if "q" in qs:
+                return self._send(200, {"answer": answer(qs["q"])})
+            if "debug" in qs:
+                return self._send(200, debug_info())
+            self._send(200, {"status": "ok", "LEDGER_URL_set": True})
+        except Exception as e:
+            self._send(200, {"error": f"{type(e).__name__}: {e}"})
 
     def do_POST(self):
         try:
             n = int(self.headers.get("Content-Length", 0))
             data = json.loads(self.rfile.read(n) or b"{}")
-            self._send(200, {"answer": answer_question(data.get("question", ""))})
+            self._send(200, {"answer": answer(data.get("question", ""))})
         except Exception as e:
-            self._send(200, {"answer": None, "error": str(e)})
+            self._send(200, {"answer": None, "error": f"{type(e).__name__}: {e}"})
